@@ -15,9 +15,9 @@ SIMPLE_REQUEST_XML_HEREDOC
 
 SIMPLE_RESPONSE_XML = <<-SIMPLE_RESPONSE_XML_HEREDOC
 <?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:tns="false">
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:tns="false">
   <soap:Body>
-    <tns:answerResponse>
+    <tns:answerResponse xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
       <Value xsi:type="xsd:int">42</Value>
     </tns:answerResponse>
   </soap:Body>
@@ -31,7 +31,7 @@ describe WashOut do
     Nori.new(
       :strip_namespaces => true,
       :advanced_typecasting => true,
-      :convert_tags_to => lambda {|x| x.snakecase.to_sym}
+      :convert_tags_to => lambda {|x| WashOut::Router.snakecase(x).to_sym}
     )
   end
 
@@ -40,15 +40,28 @@ describe WashOut do
 
     savon  = Savon::Client.new(:log => false, :wsdl => 'http://app/route/api/wsdl', &block)
     result = savon.call(method, :message => message)
-    result = result.to_hash if hashify
+    result = strip_response_ns(result.to_hash) if hashify
     result
+  end
+
+  # The sov fork declares xmlns:xsd/xmlns:xsi on the response element (604bca7)
+  # instead of the Envelope; drop them so assertions focus on the payload.
+  def strip_response_ns(hash)
+    return hash unless hash.is_a?(Hash)
+    hash.each_with_object({}) do |(k, v), out|
+      if v.is_a?(Hash)
+        v = v.reject { |key, _| [:"@xmlns:xsd", :"@xmlns:xsi"].include?(key) }
+        v = nil if v.empty?
+      end
+      out[k] = v
+    end
   end
 
   def savon!(method, message={}, &block)
     message = {:value => message} unless message.is_a?(Hash)
 
     savon = Savon::Client.new(:log => true, :wsdl => 'http://app/route/api/wsdl', &block)
-    savon.call(method, :message => message).to_hash
+    strip_response_ns(savon.call(method, :message => message).to_hash)
   end
 
   describe "Module" do
@@ -143,9 +156,9 @@ describe WashOut do
 
         expect(HTTPI.post("http://app/route/api/action", request).body).to eq <<-XML
 <?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:tns="false">
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:tns="false">
   <soap:Body>
-    <tns:answerResponse>
+    <tns:answerResponse xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
       <Value xsi:type="xsd:int">42</Value>
     </tns:answerResponse>
   </soap:Body>
@@ -174,9 +187,9 @@ describe WashOut do
 
         expect(HTTPI.post("http://app/route/api/action", request).body).to eq <<-XML
 <?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:tns="false">
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:tns="false">
   <soap:Body>
-    <tns:whateverResponse>
+    <tns:whateverResponse xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
       <Value xsi:type="xsd:int">42</Value>
     </tns:whateverResponse>
   </soap:Body>
@@ -303,7 +316,7 @@ describe WashOut do
                       },
                       :return => nil
           def rumba
-            expect(params).to eq({"rumbas" => [1, 2, 3]})
+            expect(params.to_unsafe_h).to eq({"rumbas" => [1, 2, 3]})
             render :soap => nil
           end
         end
@@ -319,7 +332,7 @@ describe WashOut do
                       },
                       :return => nil
           def rumba
-            expect(params).to eq({})
+            expect(params.to_unsafe_h).to eq({})
             render :soap => nil
           end
         end
@@ -334,7 +347,7 @@ describe WashOut do
                       },
                       :return => nil
           def rumba
-            expect(params).to eq({"nested" => {}})
+            expect(params.to_unsafe_h).to eq({"nested" => {}})
             render :soap => nil
           end
         end
@@ -352,7 +365,7 @@ describe WashOut do
                       },
                       :return => nil
           def rumba
-            expect(params).to eq({
+            expect(params.to_unsafe_h).to eq({
               "rumbas" => [
                 {"zombies" => 'suck', "puppies" => 'rock'},
                 {"zombies" => 'slow', "puppies" => 'fast'}
@@ -559,9 +572,9 @@ describe WashOut do
 
         expect(HTTPI.post("http://app/route/api/action", request).body).to eq <<-XML
 <?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:tns="false">
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:tns="false">
   <soap:Body>
-    <tns:answerResponse>
+    <tns:answerResponse xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
       <Value xsi:type="xsd:int">42</Value>
     </tns:answerResponse>
   </soap:Body>
@@ -647,14 +660,14 @@ describe WashOut do
 
         expect(HTTPI.post("http://app/route/api/action", request).body).to eq <<-XML
 <?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:tns="false">
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:tns="false">
   <soap:Header>
-    <tns:answerResponse>
+    <tns:answerResponse xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
       <Value xsi:type="xsd:string">12345</Value>
     </tns:answerResponse>
   </soap:Header>
   <soap:Body>
-    <tns:answerResponse>
+    <tns:answerResponse xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
       <Value xsi:type="xsd:int">42</Value>
     </tns:answerResponse>
   </soap:Body>
@@ -685,14 +698,14 @@ describe WashOut do
 
       expect(HTTPI.post("http://app/route/api/action", request).body).to eq <<-XML
 <?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:tns="false">
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:tns="false">
   <soap:Header>
-    <tns:answerResponse>
+    <tns:answerResponse xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
       <Auth xsi:type="xsd:string">12345</Auth>
     </tns:answerResponse>
   </soap:Header>
   <soap:Body>
-    <tns:answerResponse>
+    <tns:answerResponse xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
       <Value xsi:type="xsd:int">42</Value>
     </tns:answerResponse>
   </soap:Body>

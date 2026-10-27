@@ -16,23 +16,27 @@ module WashOut
     class ProgrammerError < Exception; end
 
     def _authenticate_wsse
-      begin
-        xml_security   = request.env['wash_out.soap_data'].values_at(:envelope, :Envelope).compact.first
-        xml_security   = xml_security.values_at(:header, :Header).compact.first
-        xml_security   = xml_security.values_at(:security, :Security).compact.first
-        username_token = xml_security.values_at(:username_token, :UsernameToken).compact.first
-      rescue
-        username_token = nil
+      username_token = soap_data_at(request.env['wash_out.soap_data'],
+        [:envelope, :Envelope], [:header, :Header], [:security, :Security], [:username_token, :UsernameToken])
+      username_token = nil unless username_token.is_a?(Hash)
+
+      wsse = WashOut::Wsse.authenticate soap_config, username_token
+
+      # Only expose a token that was checked; without WSSE it is caller-supplied.
+      if wsse.required? && username_token.present?
+        request.env['WSSE_TOKEN'] = wsse.verified_token
       end
-
-      WashOut::Wsse.authenticate soap_config, username_token
-
-      request.env['WSSE_TOKEN'] = username_token.with_indifferent_access unless username_token.blank?
     end
 
     def _map_soap_parameters
+      # Undeclared operation: leave it to _invalid_action.
+      return unless action_spec
+
+      data = xml_data
+      raise SOAPError.new("Invalid SOAP request", 'Client') unless data.is_a?(Hash)
+
       self.params = _load_params action_spec[:in],
-        _strip_empty_nodes(action_spec[:in], xml_data)
+        _strip_empty_nodes(action_spec[:in], data)
     end
 
     def _map_soap_headers
@@ -76,6 +80,7 @@ module WashOut
       @namespace = soap_config.namespace
       @prefix    = soap_config.prefix
       @name      = controller_path
+      @endpoint  = WashOut::Router.url(request, @name, soap_config.endpoint_base_url)
 
       render :template => "wash_out/#{soap_config.wsdl_style}/wsdl", :layout => false,
              :content_type => 'text/xml'
@@ -90,8 +95,17 @@ module WashOut
       @action_spec = self.class.soap_actions[soap_action]
       return _invalid_action unless @action_spec
 
+      returned_nil = result.nil?
       result = { 'value' => result } unless result.is_a? Hash
       result = HashWithIndifferentAccess.new(result)
+
+      # Keys the :return spec does not declare are not rendered. Say so (names
+      # only), since an error the app returns that way reaches the caller as an
+      # empty success. (render soap: nil returns nothing; nothing is dropped.)
+      undeclared = returned_nil ? [] : result.keys - @action_spec[:out].map { |param| param.raw_name.to_s }
+      if undeclared.any? && defined?(Rails) && Rails.logger
+        Rails.logger.warn("WashOut: #{self.class.name} #{soap_action} response dropped undeclared keys: #{undeclared.join(', ')}")
+      end
 
       inject = lambda {|data, map|
         result_spec = []
@@ -127,7 +141,7 @@ module WashOut
 
             # Inline scalar                         {:foo => :string}
             else
-              result_spec[i].value = value
+              result_spec[i].value = param.multiplied ? value.map { |v| _soap_scalar(v, param) } : _soap_scalar(value, param)
             end
           end
         end
@@ -151,18 +165,26 @@ module WashOut
              :content_type => 'text/xml'
     end
 
+    def self.invalid_action_message(soap_action)
+      "Cannot find SOAP action mapping for #{soap_action.to_s[0, 200]}"
+    end
+
     # This action is a fallback for all undefined SOAP actions.
     def _invalid_action
-      render_soap_error("Cannot find SOAP action mapping for #{request.env['wash_out.soap_action']}")
+      render_soap_error(WashOut::Dispatcher.invalid_action_message(request.env['wash_out.soap_action']), 'Client')
     end
 
     def _invalid_request
-      render_soap_error("Invalid SOAP request")
+      render_soap_error(request.env['wash_out.request_error'] || "Invalid SOAP request", 'Client')
     end
 
     def _catch_soap_errors
       yield
     rescue SOAPError => error
+      if error.code == 'Client' && defined?(Rails) && Rails.logger
+        # wash_out's own Client messages hold element names, never values.
+        Rails.logger.info("WashOut: #{self.class.name}##{action_name} answered with a Client fault: #{error.message}")
+      end
       render_soap_error(error.message, error.code)
     end
 
@@ -177,11 +199,10 @@ module WashOut
              :content_type => 'text/xml'
     end
 
+    SoapRequest = Struct.new(:params, :headers)
+
     def soap_request
-      OpenStruct.new({
-        params: @_params,
-        headers: @_soap_headers
-      })
+      SoapRequest.new(@_params, @_soap_headers)
     end
 
     def self.included(controller)
@@ -204,38 +225,39 @@ module WashOut
       end
     end
 
+    # Kept for API compatibility; the router uses WashOut::MultiRef.
+    # Appends into a single accumulator (no copy per container).
     def self.deep_select(collection, result=[], &blk)
       values = collection.respond_to?(:values) ? collection.values : collection
-      result += values.select(&blk)
+      values.each { |value| result << value if blk.call(value) }
 
       values.each do |value|
         if value.is_a?(Hash) || value.is_a?(Array)
-          result = deep_select(value, result, &blk)
+          deep_select(value, result, &blk)
         end
       end
 
       result
     end
 
+    # Kept for API compatibility; delegates to the bounded resolver, which
+    # rejects circular references, caps expansion and does not mutate +element+.
     def self.deep_replace_href(element, replace)
-      return element unless element.is_a?(Array) || element.is_a?(Hash)
-
-      if element.is_a?(Array) # Traverse arrays
-        return element.map{|x| deep_replace_href(x, replace)}
-      end
-
-      if element.has_key?(:@href) # Replace needle and traverse replacement
-        return deep_replace_href(replace[element[:@href]], replace)
-      end
-
-      element.each do |key, value| # Traverse hashes
-        element[key] = deep_replace_href(value, replace)
-      end
-
-      element
+      WashOut::MultiRef.replace(element, replace)
     end
 
     private
+    # Builder appends a Symbol argument to the element name and turns a Hash
+    # argument into attributes, so scalar values must reach it as plain values.
+    def _soap_scalar(value, param)
+      if value.is_a?(Hash) || value.is_a?(Array)
+        raise ProgrammerError,
+          "SOAP response used #{value.class.name} as the value for '#{param.raw_name}', " +
+          "which is declared as a simple type."
+      end
+      value.is_a?(Symbol) ? value.to_s : value
+    end
+
     def soap_action?
       soap_action.present?
     end
@@ -252,16 +274,33 @@ module WashOut
       request.env['wash_out.soap_action']
     end
 
+    # Follows +path+ (lists of alternative keys) through nested Hashes;
+    # nil as soon as a level is missing or is not a Hash.
+    def soap_data_at(node, *path)
+      path.each do |keys|
+        return nil unless node.is_a?(Hash)
+        node = node.values_at(*keys).compact.first
+      end
+      node
+    end
+
     def xml_data
-      envelope = request.env['wash_out.soap_data'].values_at(:envelope, :Envelope).compact.first
-      xml_data = envelope.values_at(:body, :Body).compact.first || {}
-      return xml_data if soap_config.wsdl_style == "document"
-      xml_data = xml_data.values_at(soap_action.underscore.to_sym, soap_action.to_sym, request_input_tag.to_sym).compact.first || {}
+      body = soap_data_at(request.env['wash_out.soap_data'], [:envelope, :Envelope], [:body, :Body]) || {}
+      return body if soap_config.wsdl_style == "document"
+      return nil unless body.is_a?(Hash)
+
+      # Read the element the router dispatched on, not a look-alike sibling.
+      operation = request.env['wash_out.soap_operation']
+      return body[operation] || {} if operation
+
+      # Operation from the SOAPAction header: exact names before the
+      # snakecase alias.
+      body.values_at(request_input_tag.to_sym, soap_action.to_sym, soap_action.underscore.to_sym).compact.first || {}
     end
 
     def xml_header_data
-      envelope = request.env['wash_out.soap_data'].values_at(:envelope, :Envelope).compact.first
-      header_data = envelope.values_at(:header, :Header).compact.first || {}
+      header = soap_data_at(request.env['wash_out.soap_data'], [:envelope, :Envelope], [:header, :Header])
+      header.is_a?(Hash) ? header : {}
     end
 
   end

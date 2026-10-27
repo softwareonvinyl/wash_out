@@ -234,10 +234,12 @@ With this mechanism, all the actions in the controller will be authenticated aga
 Dynamic authentication allows you to process the username and password any way you want, with the most common case being authenticating against a database. The configuration option for this mechanism is called `wsse_auth_callback`:
 
 ```ruby
-soap_service namespace: "wash_out", wsse_auth_callback: ->(username, password) {
+soap_service namespace: "wash_out", wsse_auth_callback: ->(username, password, nonce, timestamp) {
   return !User.find_by(username: username).authenticate(password).blank?
 }
 ```
+
+The callback must accept four arguments; any other callable makes every request fail rather than switching authentication off. WSSE is required as soon as any `wsse_*` option is set. Digests are checked over the `Created` text exactly as sent, within 5 minutes either side of the server clock. There is no nonce cache, so a captured digest can be replayed within that window.
 
 Keep in mind that the password may already be hashed by the SOAP client, so you would have to check against that condition too as per [spec](http://www.oasis-open.org/committees/download.php/16782/wss-v1.1-spec-os-UsernameTokenProfile.pdf)
 
@@ -248,12 +250,36 @@ To override the values on a specific controller just add an override as part of 
 
 Available properties are:
 
-* **parser**: XML parser to use – `:rexml` or `:nokogiri`. The first one is default but the latter is much faster. Be sure to add `gem nokogiri` if you want to use it.
+* **parser**: XML parser to use, `:rexml` (default) or `:nokogiri`. Only `:rexml` gets the request checks described under *Request limits*; use it for untrusted callers.
 * **wsdl_style**: sets WSDL style. Supported values are: 'document' and 'rpc'.
-* **catch_xml_errors**: intercept Rails parsing exceptions to return correct XML response for corrupt XML input. Default is `false`.
+* **catch_xml_errors**: kept for compatibility and no longer changes anything. Requests that cannot be parsed always get a Client SOAP fault from the router.
 * **namespace**: SOAP namespace to use. Default is `urn:WashOut`.
+* **prefix**: namespace prefix used in responses and the WSDL. Default is `tns`. It must be an XML name other than `soap`, `soap-enc`, `xsd`, `xsi`, `wsdl` or `xml*`.
+* **namespaces**: extra namespace declarations for responses, e.g. `[{ 'xmlns:shar' => 'urn:...' }]`. They must not rebind the service prefix, `tns`, or a reserved prefix.
 * **snakecase_input**: Determines if WashOut should modify parameters keys to snakecase. Default is `false`.
 * **camelize_wsdl**: Determines if WashOut should camelize types within WSDL and responses. Supports `true` for CamelCase and `:lower` for camelCase. Default is `false`.
+* **max_request_size**: largest request body in bytes. Default `1_048_576` (1 MiB); `nil` disables it.
+* **max_nesting_depth**: deepest element nesting accepted. Default `100`, at most `200`.
+* **max_elements**: most elements, attributes and text nodes accepted in one request. Default `100_000`.
+* **endpoint_base_url**: origin advertised as the WSDL `soap:address`, e.g. `"https://api.example.com"`. Without it the address follows the request's Host / X-Forwarded-Host header. Set it in production.
+
+A config built by `soap_service` is frozen; call `soap_service` again to change it.
+
+### Request limits
+
+The router checks every request before any controller code runs, so before your own authentication. It answers with a `Client` SOAP fault, without running controller callbacks, when:
+
+* the method is not POST, or the body is larger than `max_request_size`;
+* the XML has a DOCTYPE, more than one root element, nesting deeper than `max_nesting_depth`, more than `max_elements` elements, attributes and text nodes, characters outside XML 1.0 (anywhere in a UTF-8 document; in text and attribute values for UTF-16), or bytes that are not valid in its encoding;
+* there is no Envelope with a Body, Header or Body is spelled twice, the rpc operation element holds text or repeats, or the operation is not declared (in rpc style with `soap_action_routing`, a Body that has elements but none named after the SOAPAction is refused too);
+* a SOAP-encoded `href` that is followed is circular, dangling or points at a duplicated id, or an `href` sits on the Envelope, Header, Body, the rpc operation element or a document-style message part;
+* resolving references would build more than max(50,000 entries, 8 x the entries sent), or hand on more text than max(`max_request_size`, 8 x the text sent). Rpc/encoded Body-level multiRef elements count once, where they are referenced.
+
+UTF-8 and UTF-16 (with a byte order mark) requests are accepted.
+
+Arguments are typed strictly from the WSDL: `xsd:int` and `xsd:long` ranges, decimal or exponent doubles, booleans `true`, `false`, `1` and `0`. A plain `type="..."` attribute is ignored, and strings arrive exactly as sent. Child or repeated elements where a single simple value is declared are refused. Faults name the element path, for example `Invalid SOAP parameter 'PO/LineItemArray/LineItem[2]/unitPrice' format`, and the reason is logged at info level. wash_out never logs request bodies, and it drops form-typed bodies on the `/action` and `/wsdl` routes before Rails logs parameters. Middleware that runs before routing, such as `Rack::MethodOverride`, can still read a form-typed body, so cap request sizes in the web server too.
+
+Still lenient, as in 0b7d787: `:date`, `:datetime` and `:time` arguments are parsed with Ruby's `Date.parse`-style parsing, `:base64Binary` ignores characters outside the alphabet, and REXML does not enforce every well-formedness rule: an undeclared entity reference (`&foo;`), a bare `&`, `<` in an attribute value or `]]>` in text reach the app as text. Return values typed `:base64Binary` are written as given, so encode them yourself.
 
 ### Camelization
 

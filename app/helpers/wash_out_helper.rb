@@ -19,7 +19,8 @@ module WashOutHelper
   def wsdl_data_attrs(param)
     param.map.reduce({}) do |memo, p|
       if p.respond_to?(:attribute?) && p.attribute?
-        memo.merge p.attr_name => p.value
+        # Builder writes Symbol attribute values without escaping.
+        memo.merge p.attr_name => (p.value.is_a?(Symbol) ? p.value.to_s : p.value)
       else
         memo
       end

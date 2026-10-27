@@ -170,7 +170,7 @@ describe WashOut::Dispatcher do
 
     it "should handle empty strings that have been parsed wrong by nori, but preserve attrs" do
       dispatcher._map_soap_parameters
-      expect(dispatcher.params).to eq("foo" => { "bar" => "buzz", "empty" => nil })
+      expect(dispatcher.params.to_unsafe_h).to eq("foo" => { "bar" => "buzz", "empty" => nil })
     end
   end
 

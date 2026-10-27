@@ -3,31 +3,25 @@ require 'wash_out/middleware'
 require 'rexml/document'
 
 describe WashOut::Middleware do
-  it 'handles Rack environment variables' do
-    err = begin
+  let(:error) do
+    begin
       REXML::Document.new '<hi>'
     rescue REXML::ParseException => e
       e
     end
+  end
 
-    env = {}
-    expect {
-      WashOut::Middleware.raise_or_render_rexml_parse_error err, env
-    }.to raise_exception(REXML::ParseException)
+  # WashOut::Router answers unparseable request bodies itself, so a REXML error
+  # that reaches the middleware comes from server code and must not be turned
+  # into a Client fault (or swallowed).
+  it 'lets REXML errors from server code propagate, with or without SOAPAction' do
+    app = described_class.new(->(_env) { raise error })
+    expect { app.call({}) }.to raise_exception(REXML::ParseException)
+    expect { app.call('HTTP_SOAPACTION' => 'x') }.to raise_exception(REXML::ParseException)
+  end
 
-    env['HTTP_SOAPACTION'] = 'pretend_action'
-    env['rack.errors'] = double 'logger', {:puts => true} 
-    env['rack.input'] = double 'basic-rack-input', {:string => '<hi>'} 
-    result = WashOut::Middleware.raise_or_render_rexml_parse_error err, env
-    expect(result[0]).to eq 400
-    expect(result[1]['Content-Type']).to eq 'text/xml'
-    msg = result[2][0]
-    expect(msg).to include 'Error parsing SOAP Request XML'
-    expect(msg).to include 'soap:Fault'
-    expect(msg).not_to include __FILE__
-    
-    env['rack.input'] = double 'passenger-input', {:read => '<hi>'}
-    result = WashOut::Middleware.raise_or_render_rexml_parse_error err, env
-    expect(result[0]).to eq 400
+  it 'passes responses through' do
+    app = described_class.new(->(_env) { [200, {}, ['ok']] })
+    expect(app.call({})).to eq [200, {}, ['ok']]
   end
 end
