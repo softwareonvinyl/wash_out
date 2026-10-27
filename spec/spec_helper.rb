@@ -1,13 +1,13 @@
 # Configure Rails Envinronment
 ENV["RAILS_ENV"] = "test"
 
+unless ENV["NO_COVERAGE"]
 require "simplecov"
 SimpleCov.start do
-  add_filter 'spec'
-  add_group 'Library', 'lib'
-  add_group 'App', 'app'
-
-  at_exit do; end
+  skip 'spec'
+  group 'Library', 'lib'
+  group 'App', 'app'
+end
 end
 
 require File.expand_path("../dummy/config/environment.rb",  __FILE__)
@@ -36,15 +36,6 @@ RSpec.configure do |config|
     }
   end
 
-  config.after(:suite) do
-    if SimpleCov.running
-      silence_stream(STDOUT) do
-        SimpleCov::Formatter::HTMLFormatter.new.format(SimpleCov.result)
-      end
-
-      SimpleCov::Formatter::SummaryFormatter.new.format(SimpleCov.result)
-    end
-  end
 end
 
 HTTPI.logger = Logger.new(open("/dev/null", 'w'))
@@ -74,7 +65,10 @@ def mock_controller(options = {}, &block)
     class_exec &block if block
   }
 
-  ActiveSupport::Dependencies::Reference.instance_variable_get(:'@store').delete('Route::Space::ApiController')
+  # Rails < 7 (classic autoloader) caches constant references; Zeitwerk does not.
+  if defined?(ActiveSupport::Dependencies::Reference)
+    ActiveSupport::Dependencies::Reference.instance_variable_get(:'@store').delete('Route::Space::ApiController')
+  end
 end
 
 unless defined?(silence_stream) # Rails 5

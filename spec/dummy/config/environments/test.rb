@@ -14,7 +14,8 @@ Dummy::Application.configure do
   config.action_controller.perform_caching = false
 
   # Raise exceptions instead of rendering exception templates
-  config.action_dispatch.show_exceptions = false
+  # Rails >= 7.1 only treats :none as "raise"; false now means show error pages.
+  config.action_dispatch.show_exceptions = Rails.gem_version >= Gem::Version.new('7.1') ? :none : false
 
   # Disable request forgery protection in test environment
   config.action_controller.allow_forgery_protection    = false

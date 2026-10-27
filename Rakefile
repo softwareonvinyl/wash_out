@@ -1,9 +1,14 @@
 require 'bundler/setup'
 require 'bundler/gem_tasks'
-require 'appraisal'
 require 'rspec/core/rake_task'
 
 RSpec::Core::RakeTask.new
+
+begin
+  require 'appraisal'
+rescue LoadError
+  # Appraisal is optional: `rake` runs the suite against the Gemfile's Rails.
+end
 
 task :console do
   require "action_controller/railtie"
@@ -13,10 +18,10 @@ task :console do
 end
 
 
-desc 'Default: run the unit tests.'
-task default: [:all]
+desc 'Default: run the specs.'
+task default: [:spec]
 
-desc 'Test the plugin under all supported Rails versions.'
+desc 'Test the plugin under all Appraisal Rails versions (needs the appraisal gem).'
 task :all do |_t|
     # this is needed for minitest because it does not support "--pattern" option as Rspec Does
     ENV['SPEC'] = '--name=spec/**{,/*/**}/*_spec.rb'

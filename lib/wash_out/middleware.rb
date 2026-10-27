@@ -1,29 +1,32 @@
+require 'builder'
+require 'rexml/parseexception'
+
+# Kept so apps that set config.wash_out.catch_xml_errors keep booting; it no
+# longer changes anything.
+#
+# It used to turn REXML::ParseException into a 400 Client fault. WashOut::Router
+# now answers every request it cannot parse with a Client fault itself, so a
+# REXML error that reaches this middleware comes from server code (an action
+# parsing some other XML). Answering that as a client error would hide a
+# server bug from error reporting, so it is left to propagate.
 class WashOut::Middleware
   def initialize app
     @app = app
   end
 
   def call env
-    begin
-      @app.call env
-    rescue REXML::ParseException => e
-      self.class.raise_or_render_rexml_parse_error e, env
-    end
+    @app.call env
   end
 
   def self.raise_or_render_rexml_parse_error e, env
-    raise e unless env.has_key? 'HTTP_SOAPACTION'
-  
-    # Normally input would be a StringIO, but Passenger has a different API:
-    input = env['rack.input']
-    req = if input.respond_to? :string then input.string else input.read end
+    raise e
+  end
 
-    env['rack.errors'].puts <<-EOERR
-WashOut::Exception: #{e.continued_exception} for:
-#{req}
-    EOERR
-    [400, {'Content-Type' => 'text/xml'},
-      [render_client_soap_fault("Error parsing SOAP Request XML")]]
+  def self.request_size env
+    length = env['CONTENT_LENGTH'].to_s
+    return length.to_i if length =~ /\A\d+\z/
+    input = env['rack.input']
+    input.respond_to?(:size) ? input.size : 0
   end
 
   def self.render_client_soap_fault msg

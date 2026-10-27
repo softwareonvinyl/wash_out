@@ -1,3 +1,5 @@
+require 'base64'
+
 module WashOut
   class Param
     attr_accessor :raw_name
@@ -8,6 +10,68 @@ module WashOut
     attr_accessor :value
     attr_accessor :source_class
     attr_accessor :soap_config
+
+    # Value ranges of the XSD types published in the WSDL (:integer is xsd:int).
+    XSD_INT_RANGE  = (-(2**31))..(2**31 - 1)
+    XSD_LONG_RANGE = (-(2**63))..(2**63 - 1)
+    # Longest numeric text accepted, so no conversion works on huge input.
+    MAX_NUMBER_LENGTH = 64
+
+    # Simple types Param#load can read.
+    LOADABLE_TYPES = %w[string integer long double boolean date datetime time base64Binary].freeze
+
+    # Raised for a value that does not fit its type. Messages name the rule
+    # only, never the value, so they are safe to log.
+    class InvalidValue < ArgumentError; end
+
+    INTEGER_FORMAT = /\A[+-]?\d+\z/
+    DOUBLE_FORMAT  = /\A[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?\z/
+
+    # xsd:int / xsd:long. Rejects anything that is not a whole number in range.
+    def self.coerce_integer(value, range)
+      if value.is_a?(String)
+        text = value.strip
+        raise InvalidValue, 'not an integer' unless text.length <= MAX_NUMBER_LENGTH && text.match?(INTEGER_FORMAT)
+        value = text.to_i
+      end
+      raise InvalidValue, 'not an integer' unless value.is_a?(Integer)
+      raise InvalidValue, 'integer out of range' unless range.cover?(value)
+      value
+    end
+
+    # xsd:double. Rejects text that is not a number, and non-finite results.
+    def self.coerce_double(value)
+      if value.is_a?(String)
+        text = value.strip
+        raise InvalidValue, 'not a number' unless text.length <= MAX_NUMBER_LENGTH && text.match?(DOUBLE_FORMAT)
+        # XSD allows a '.' with no digits after it ("5.", "1.e5"); Kernel#Float does not.
+        value = text.sub(/\.(?=[eE]|\z)/, '.0')
+      end
+      number = Float(value)
+      raise InvalidValue, 'not a finite number' unless number.finite?
+      number
+    end
+
+    # An empty element that carries only attributes (xsi:type, xmlns, ...),
+    # which Nori parses as {"@xsi:type" => "xsd:string"}.
+    def self.attributes_only?(value)
+      value.is_a?(Hash) && !value.empty? && value.each_key.all? { |k| k.to_s.start_with?('@') }
+    end
+
+    # What an empty item of a repeated simple value has always loaded as
+    # (nil.to_s, nil.to_i, ... in 0b7d787). Apps rely on it, e.g. a blank
+    # filter value is "" rather than nil.
+    EMPTY_ITEM = { 'string' => ''.freeze, 'integer' => 0, 'long' => 0, 'double' => 0.0, 'boolean' => false }.freeze
+
+    # xsd:boolean: true/1 and false/0 (any case, surrounding whitespace ignored).
+    def self.coerce_boolean(value)
+      return value if value == true || value == false
+      case value.to_s.strip.downcase
+      when 'true', '1'  then true
+      when 'false', '0' then false
+      else raise InvalidValue, 'not a boolean'
+      end
+    end
 
     # Defines a WSDL parameter with name +name+ and type specifier +type+.
     # The type specifier format is described in #parse_def.
@@ -39,34 +103,40 @@ module WashOut
 
     # Converts a generic externally derived Ruby value, such as String or
     # Hash, to a native Ruby object according to the definition of this type.
-    def load(data, key)
+    # +path+ names the element in faults and logs, e.g. PO/LineItemArray/LineItem[2]/unitPrice.
+    def load(data, key, path = nil)
       if !data.has_key? key
         raise WashOut::Dispatcher::SOAPError, "Required SOAP parameter '#{key}' is missing"
       end
 
+      path = path ? "#{path}/#{key}" : key.to_s
       data = data[key]
-      data = [data] if @multiplied && !data.is_a?(Array)
 
       if struct?
-        data ||= {}
         if @multiplied
-          data.map do |x|
-            map_struct x do |param, dat, elem|
-              param.load(dat, elem)
+          # An empty repeated element (<ItemArray/>) is still a fault, as in
+          # 0b7d787: apps (PurchaseOrderBuilder) index x[0] without a guard, so
+          # accepting it would turn a visible fault into a silent failure.
+          items = data.is_a?(Array) ? data : [data]
+          items.each_with_index.map do |x, i|
+            item_path = "#{path}[#{i + 1}]"
+            map_struct(x, item_path) do |param, dat, elem|
+              param.load(dat, elem, item_path)
             end
           end
         else
-          map_struct data do |param, dat, elem|
-            param.load(dat, elem)
+          data ||= {}
+          map_struct(data, path) do |param, dat, elem|
+            param.load(dat, elem, path)
           end
         end
       else
         operation = case type
           when 'string';       :to_s
-          when 'integer';      :to_i
-          when 'long';         :to_i
-          when 'double';       :to_f
-          when 'boolean';      lambda{|dat| dat === "0" ? false : !!dat}
+          when 'integer';      lambda{|dat| self.class.coerce_integer(dat, XSD_INT_RANGE)}
+          when 'long';         lambda{|dat| self.class.coerce_integer(dat, XSD_LONG_RANGE)}
+          when 'double';       lambda{|dat| self.class.coerce_double(dat)}
+          when 'boolean';      lambda{|dat| self.class.coerce_boolean(dat)}
           when 'date';         :to_date
           when 'datetime';     :to_datetime
           when 'time';         :to_time
@@ -74,20 +144,58 @@ module WashOut
           else raise RuntimeError, "Invalid WashOut simple type: #{type}"
         end
 
+        data = [data] if @multiplied && !data.is_a?(Array)
+
+        cast = lambda do |dat|
+          if dat.nil? || self.class.attributes_only?(dat)
+            nil
+          elsif dat.is_a?(Hash) || dat.is_a?(Array)
+            # Child elements or a repeated element where one value is declared.
+            raise InvalidValue, 'not a simple value'
+          elsif operation.is_a?(Symbol)
+            dat.send(operation)
+          else
+            operation.call(dat)
+          end
+        end
+
         begin
           if data.nil?
             data
           elsif @multiplied
-            return data.map{|x| x.send(operation)} if operation.is_a?(Symbol)
-            return data.map{|x| operation.call(x)} if operation.is_a?(Proc)
-          elsif operation.is_a? Symbol
-            data.send(operation)
+            data.map do |item|
+              value = cast.call(item)
+              value.nil? ? EMPTY_ITEM[type] : value
+            end
           else
-            operation.call(data)
+            cast.call(data)
           end
-        rescue
-          raise WashOut::Dispatcher::SOAPError, "Invalid SOAP parameter '#{key}' format"
+        rescue => error
+          # The rule broken, never the value (it may be a password).
+          reason = error.is_a?(InvalidValue) ? error.message : error.class.name
+          if defined?(Rails) && Rails.respond_to?(:logger) && Rails.logger
+            Rails.logger.info("WashOut: invalid SOAP parameter #{path} (#{type}): #{reason}")
+          end
+          raise WashOut::Dispatcher::SOAPError.new("Invalid SOAP parameter '#{path}' format", 'Client')
         end
+      end
+    end
+
+    # True if any param in +params+ (recursively) is the attribute @+name+.
+    # Simple types in +params+ (recursively) that Param#load cannot read.
+    def self.unloadable_types(params)
+      params.flat_map do |param|
+        if param.struct?
+          unloadable_types(param.map)
+        else
+          LOADABLE_TYPES.include?(param.type.to_s) ? [] : [param.type.to_s]
+        end
+      end.uniq
+    end
+
+    def self.declares_attribute?(params, name)
+      params.any? do |param|
+        param.raw_name.to_s == "@#{name}" || (param.struct? && declares_attribute?(param.map, name))
       end
     end
 
@@ -178,9 +286,10 @@ module WashOut
     private
 
     # Used to load an entire structure.
-    def map_struct(data)
+    def map_struct(data, path = nil)
       unless data.is_a?(Hash)
-        raise WashOut::Dispatcher::SOAPError, "SOAP message structure is broken"
+        where = path ? " at '#{path}'" : ''
+        raise WashOut::Dispatcher::SOAPError.new("SOAP message structure is broken#{where}", 'Client')
       end
 
       data   = data.with_indifferent_access
